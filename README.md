@@ -76,3 +76,15 @@ docker compose exec kafka `
 ```
 
 更完整說明請看 `FULL_RUN_V1.md`。
+
+## Permission-safe first start (GCP/Linux)
+
+Runtime database/broker/Airflow-write data uses Docker named volumes, while `airflow/dags` is mounted read-only. Containers therefore do not change ownership of Git-managed source files.
+
+```bash
+git clone https://github.com/andy22913539/airflow-kafka.git
+cd airflow-kafka
+bash scripts/first-start.sh
+```
+
+See `PERMISSIONS_AND_DEPLOY.md` for details.

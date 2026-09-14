@@ -26,9 +26,11 @@ x-airflow-common: &airflow-common
     MAX_NOT_FOUND_LIMIT: ${MAX_NOT_FOUND_LIMIT:-50}
     YTOWER_DAG_SCHEDULE: ${YTOWER_DAG_SCHEDULE:-}
   volumes:
-    - ./airflow/dags:/opt/airflow/dags
-    - ./airflow/logs:/opt/airflow/logs
-    - ./airflow/plugins:/opt/airflow/plugins
+    # DAG source stays owned by the Git user. Airflow only needs read access.
+    - ./airflow/dags:/opt/airflow/dags:ro
+    # Runtime-written paths use Docker named volumes so containers never chown the Git repo.
+    - airflow_logs:/opt/airflow/logs
+    - airflow_plugins:/opt/airflow/plugins
   networks: [recipe-net]
 
 x-crawler-common: &crawler-common
@@ -78,22 +80,23 @@ services:
     user: root
     command: >
       sh -c "
-        mkdir -p /mnt/mysql /mnt/mongodb /mnt/kafka /mnt/postgres /mnt/airflow-logs /mnt/airflow-dags /mnt/airflow-plugins &&
+        mkdir -p /mnt/mysql /mnt/mongodb /mnt/kafka /mnt/postgres /mnt/airflow-logs /mnt/airflow-plugins &&
         chown -R 999:999 /mnt/mysql &&
         chown -R 999:999 /mnt/mongodb &&
         chown -R 1000:1000 /mnt/kafka &&
         chown -R 70:70 /mnt/postgres &&
-        chown -R ${AIRFLOW_UID:-50000}:0 /mnt/airflow-logs /mnt/airflow-dags /mnt/airflow-plugins &&
-        chmod -R 775 /mnt/airflow-logs /mnt/airflow-dags /mnt/airflow-plugins
+        chown -R ${AIRFLOW_UID:-50000}:0 /mnt/airflow-logs /mnt/airflow-plugins &&
+        chmod -R 775 /mnt/airflow-logs /mnt/airflow-plugins
       "
     volumes:
-      - ./mysql/data:/mnt/mysql
-      - ./mongodb/data:/mnt/mongodb
-      - ./kafka/data:/mnt/kafka
-      - ./postgres/data:/mnt/postgres
-      - ./airflow/logs:/mnt/airflow-logs
-      - ./airflow/dags:/mnt/airflow-dags
-      - ./airflow/plugins:/mnt/airflow-plugins
+      # Only Docker-managed named volumes are permission-adjusted here.
+      # Nothing inside the Git working tree is chowned by a container.
+      - mysql_data:/mnt/mysql
+      - mongodb_data:/mnt/mongodb
+      - kafka_data:/mnt/kafka
+      - postgres_data:/mnt/postgres
+      - airflow_logs:/mnt/airflow-logs
+      - airflow_plugins:/mnt/airflow-plugins
 
   mysql:
     image: mysql:8.4
@@ -111,8 +114,7 @@ services:
     ports:
       - "127.0.0.1:${MYSQL_PORT:-3307}:3306"
     volumes:
-      - ./mysql/data:/var/lib/mysql
-      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+      - mysql_data:/var/lib/mysql
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
       interval: 10s
@@ -139,7 +141,7 @@ services:
     ports:
       - "127.0.0.1:${MONGO_PORT:-27018}:27017"
     volumes:
-      - ./mongodb/data:/data/db
+      - mongodb_data:/data/db
       - ./mongodb/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "mongosh --quiet --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep 1"]
@@ -174,7 +176,7 @@ services:
     ports:
       - "127.0.0.1:${KAFKA_PORT:-9094}:9094"
     volumes:
-      - ./kafka/data:/tmp/kraft-combined-logs
+      - kafka_data:/tmp/kraft-combined-logs
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
       interval: 10s
@@ -220,7 +222,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-airflow}
       TZ: ${TZ:-Asia/Taipei}
     volumes:
-      - ./postgres/data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow} -d ${POSTGRES_DB:-airflow}"]
       interval: 10s
@@ -385,6 +387,14 @@ services:
       MONGO_BATCH_SIZE: ${MONGO_BATCH_SIZE:-50}
     command: ["python", "/app/workers/mongo_writer.py"]
     networks: [recipe-net]
+
+volumes:
+  mysql_data:
+  mongodb_data:
+  kafka_data:
+  postgres_data:
+  airflow_logs:
+  airflow_plugins:
 
 networks:
   recipe-net:
