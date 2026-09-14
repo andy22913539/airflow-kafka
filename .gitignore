@@ -1,0 +1,36 @@
+# Secrets / local environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime database / broker data
+mysql/data/
+mongodb/data/
+postgres/data/
+kafka/data/
+
+# Airflow runtime files
+airflow/logs/
+airflow/plugins/
+
+# Generic logs
+logs/
+*.log
+
+# Temporary / backup files
+*.tmp
+*.orig
+*.bak

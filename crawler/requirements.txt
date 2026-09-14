@@ -1,0 +1,4 @@
+beautifulsoup4>=4.12,<5
+kafka-python-ng>=2.2,<3
+pymongo>=4.7,<5
+requests[socks]>=2.32,<3

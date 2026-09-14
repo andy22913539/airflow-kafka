@@ -1,0 +1,364 @@
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: &airflow-common-env
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET_KEY}
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Asia/Taipei
+    TZ: ${TZ:-Asia/Taipei}
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_JOB_TOPIC: ${KAFKA_JOB_TOPIC:-crawler_jobs}
+    KAFKA_RESULT_TOPIC: ${KAFKA_RESULT_TOPIC:-ytower_recipe_results}
+    MONGO_HOST: mongodb
+    MONGO_INTERNAL_PORT: 27017
+    MONGO_DATABASE: ${MONGO_DATABASE:-recipe_ai}
+    MONGO_APP_USER: ${MONGO_APP_USER}
+    MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+    MYSQL_DATABASE: ${MYSQL_DATABASE:-recipe_ai}
+    MYSQL_USER: ${MYSQL_USER:-recipe_app}
+    MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    MAX_SEQ_NUMBER: ${MAX_SEQ_NUMBER:-5000}
+    MAX_NOT_FOUND_LIMIT: ${MAX_NOT_FOUND_LIMIT:-50}
+    BACKTRACK_COUNT: ${BACKTRACK_COUNT:-10}
+    YTOWER_DAG_SCHEDULE: ${YTOWER_DAG_SCHEDULE:-}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+  networks: [recipe-net]
+
+x-crawler-common: &crawler-common
+  build:
+    context: .
+    dockerfile: crawler/Dockerfile
+  restart: unless-stopped
+  depends_on:
+    kafka-init:
+      condition: service_completed_successfully
+  environment: &crawler-common-env
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_JOB_TOPIC: ${KAFKA_JOB_TOPIC:-crawler_jobs}
+    KAFKA_RESULT_TOPIC: ${KAFKA_RESULT_TOPIC:-ytower_recipe_results}
+    KAFKA_GROUP_ID: ytower-crawler-group
+    REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-20}
+    REQUEST_RETRIES: ${REQUEST_RETRIES:-3}
+    MAX_POLL_INTERVAL_MS: ${MAX_POLL_INTERVAL_MS:-28800000}
+    MAX_NOT_FOUND_LIMIT: ${MAX_NOT_FOUND_LIMIT:-50}
+    MAX_PROXY_SWITCHES_PER_SEQ: ${MAX_PROXY_SWITCHES_PER_SEQ:-5}
+    PROXY_WAIT_SECONDS: ${PROXY_WAIT_SECONDS:-15}
+    PROXY_COUNTRY_CODE: ${PROXY_COUNTRY_CODE:-TW}
+    PROXY_MAX_FAILURES: ${PROXY_MAX_FAILURES:-3}
+    PROXY_LEASE_SECONDS: ${PROXY_LEASE_SECONDS:-1800}
+    MONGO_HOST: mongodb
+    MONGO_PORT: 27017
+    MONGO_DATABASE: ${MONGO_DATABASE:-recipe_ai}
+    MONGO_APP_USER: ${MONGO_APP_USER}
+    MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+    COOLDOWN_SUCCESS_COUNT: ${COOLDOWN_SUCCESS_COUNT:-50}
+    CRAWL_SLEEP_MIN: ${CRAWL_SLEEP_MIN:-2.5}
+    CRAWL_SLEEP_MAX: ${CRAWL_SLEEP_MAX:-5.0}
+    NOT_FOUND_SLEEP_MIN: ${NOT_FOUND_SLEEP_MIN:-0.5}
+    NOT_FOUND_SLEEP_MAX: ${NOT_FOUND_SLEEP_MAX:-1.2}
+    COOLDOWN_SLEEP_MIN: ${COOLDOWN_SLEEP_MIN:-10}
+    COOLDOWN_SLEEP_MAX: ${COOLDOWN_SLEEP_MAX:-20}
+  command: ["python", "/app/workers/ytower_crawler_worker.py"]
+  networks: [recipe-net]
+
+services:
+  init-permissions:
+    image: alpine:3.20
+    user: root
+    command: >
+      sh -c "
+        mkdir -p /mnt/mysql /mnt/mongodb /mnt/kafka /mnt/postgres /mnt/airflow-logs /mnt/airflow-dags /mnt/airflow-plugins &&
+        chown -R 999:999 /mnt/mysql &&
+        chown -R 999:999 /mnt/mongodb &&
+        chown -R 1000:1000 /mnt/kafka &&
+        chown -R 70:70 /mnt/postgres &&
+        chown -R ${AIRFLOW_UID:-50000}:0 /mnt/airflow-logs /mnt/airflow-dags /mnt/airflow-plugins &&
+        chmod -R 775 /mnt/airflow-logs /mnt/airflow-dags /mnt/airflow-plugins
+      "
+    volumes:
+      - ./mysql/data:/mnt/mysql
+      - ./mongodb/data:/mnt/mongodb
+      - ./kafka/data:/mnt/kafka
+      - ./postgres/data:/mnt/postgres
+      - ./airflow/logs:/mnt/airflow-logs
+      - ./airflow/dags:/mnt/airflow-dags
+      - ./airflow/plugins:/mnt/airflow-plugins
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-recipe_ai}
+      MYSQL_USER: ${MYSQL_USER:-recipe_app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: ${TZ:-Asia/Taipei}
+    ports:
+      - "127.0.0.1:${MYSQL_PORT:-3307}:3306"
+    volumes:
+      - ./mysql/data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [recipe-net]
+
+  mongodb:
+    build:
+      context: ./mongodb
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-recipe_ai}
+      MONGO_APP_USER: ${MONGO_APP_USER}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+      TZ: ${TZ:-Asia/Taipei}
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27018}:27017"
+    volumes:
+      - ./mongodb/data:/data/db
+      - ./mongodb/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand({ping:1}).ok' | grep 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks: [recipe-net]
+
+  kafka:
+    image: apache/kafka:3.8.0
+    restart: unless-stopped
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:29093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_PORT:-9094}
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      TZ: ${TZ:-Asia/Taipei}
+    ports:
+      - "127.0.0.1:${KAFKA_PORT:-9094}:9094"
+    volumes:
+      - ./kafka/data:/tmp/kraft-combined-logs
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+    networks: [recipe-net]
+
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_JOB_TOPIC:-crawler_jobs} --partitions ${KAFKA_JOB_PARTITIONS:-4} --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_RESULT_TOPIC:-ytower_recipe_results} --partitions ${KAFKA_RESULT_PARTITIONS:-4} --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic ${KAFKA_JOB_TOPIC:-crawler_jobs} &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic ${KAFKA_RESULT_TOPIC:-ytower_recipe_results}
+      "
+    networks: [recipe-net]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+      TZ: ${TZ:-Asia/Taipei}
+    volumes:
+      - ./postgres/data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow} -d ${POSTGRES_DB:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    networks: [recipe-net]
+
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password "${AIRFLOW_ADMIN_PASSWORD}" || true
+
+  airflow-webserver:
+    <<: *airflow-common
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail http://localhost:8080/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  proxy-manager:
+    build:
+      context: .
+      dockerfile: crawler/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      MONGO_HOST: mongodb
+      MONGO_PORT: 27017
+      MONGO_DATABASE: ${MONGO_DATABASE:-recipe_ai}
+      MONGO_APP_USER: ${MONGO_APP_USER}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+      PROXY_COUNTRY_CODE: ${PROXY_COUNTRY_CODE:-TW}
+      PROXY_DISCOVERY_INTERVAL: ${PROXY_DISCOVERY_INTERVAL:-1800}
+      PROXY_VALIDATION_TIMEOUT: ${PROXY_VALIDATION_TIMEOUT:-8}
+      PROXY_VALIDATION_WORKERS: ${PROXY_VALIDATION_WORKERS:-20}
+      PROXY_MAX_VALIDATE_PER_CYCLE: ${PROXY_MAX_VALIDATE_PER_CYCLE:-120}
+      PROXY_MAX_LATENCY_MS: ${PROXY_MAX_LATENCY_MS:-5000}
+      PROXY_TCP_TIMEOUT: ${PROXY_TCP_TIMEOUT:-3}
+      PROXY_STALE_HOURS: ${PROXY_STALE_HOURS:-12}
+    command: ["python", "/app/workers/proxy_manager.py"]
+    networks: [recipe-net]
+
+  crawler-worker-1:
+    <<: *crawler-common
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      proxy-manager:
+        condition: service_started
+    environment:
+      <<: *crawler-common-env
+      WORKER_NAME: crawler-worker-1
+
+  crawler-worker-2:
+    <<: *crawler-common
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      proxy-manager:
+        condition: service_started
+    environment:
+      <<: *crawler-common-env
+      WORKER_NAME: crawler-worker-2
+
+  crawler-worker-3:
+    <<: *crawler-common
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      proxy-manager:
+        condition: service_started
+    environment:
+      <<: *crawler-common-env
+      WORKER_NAME: crawler-worker-3
+
+  crawler-worker-4:
+    <<: *crawler-common
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      proxy-manager:
+        condition: service_started
+    environment:
+      <<: *crawler-common-env
+      WORKER_NAME: crawler-worker-4
+
+  mongo-writer:
+    build:
+      context: .
+      dockerfile: crawler/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_RESULT_TOPIC: ${KAFKA_RESULT_TOPIC:-ytower_recipe_results}
+      KAFKA_GROUP_ID: ytower-mongo-writer
+      MONGO_HOST: mongodb
+      MONGO_PORT: 27017
+      MONGO_DATABASE: ${MONGO_DATABASE:-recipe_ai}
+      MONGO_APP_USER: ${MONGO_APP_USER}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD}
+      MONGO_BATCH_SIZE: ${MONGO_BATCH_SIZE:-50}
+    command: ["python", "/app/workers/mongo_writer.py"]
+    networks: [recipe-net]
+
+networks:
+  recipe-net:
+    driver: bridge

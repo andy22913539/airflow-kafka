@@ -1,0 +1,3 @@
+FROM mongo:7.0
+ENV TZ=Asia/Taipei
+EXPOSE 27017
