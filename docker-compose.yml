@@ -190,45 +190,87 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command: >
-      "
-      set -e;
-      JOB_TOPIC='${KAFKA_JOB_TOPIC:-crawler_jobs}';
-      JOB_PARTITIONS='${KAFKA_JOB_PARTITIONS:-5}';
-      RESULT_TOPIC='${KAFKA_RESULT_TOPIC:-ytower_recipe_results}';
-      RESULT_PARTITIONS='${KAFKA_RESULT_PARTITIONS:-4}';
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$JOB_TOPIC" --partitions "$$JOB_PARTITIONS" --replication-factor 1;
-      CURRENT=$$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$JOB_TOPIC" | sed -n 's/.*PartitionCount: \([0-9][0-9]*\).*/\1/p' | head -n1);
-      if [ -n "$$CURRENT" ] && [ "$$CURRENT" -lt "$$JOB_PARTITIONS" ]; then
-        echo "Increasing $$JOB_TOPIC partitions: $$CURRENT -> $$JOB_PARTITIONS";
-        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --alter --topic "$$JOB_TOPIC" --partitions "$$JOB_PARTITIONS";
-      fi;
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$RESULT_TOPIC" --partitions "$$RESULT_PARTITIONS" --replication-factor 1;
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$JOB_TOPIC";
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$RESULT_TOPIC"
-      "
-    networks: [recipe-net]
 
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    depends_on:
-      init-permissions:
-        condition: service_completed_successfully
+    entrypoint:
+      - /bin/bash
+      - -ec
+
+    command:
+      - |
+        echo "=== Kafka topic initialization ==="
+
+        JOB_TOPIC="$${KAFKA_JOB_TOPIC:-crawler_jobs}"
+        RESULT_TOPIC="$${KAFKA_RESULT_TOPIC:-ytower_recipe_results}"
+        JOB_PARTITIONS="$${KAFKA_JOB_PARTITIONS:-5}"
+        RESULT_PARTITIONS="$${KAFKA_RESULT_PARTITIONS:-4}"
+
+        echo "Job topic: $$JOB_TOPIC"
+        echo "Job partitions: $$JOB_PARTITIONS"
+        echo "Result topic: $$RESULT_TOPIC"
+        echo "Result partitions: $$RESULT_PARTITIONS"
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic "$$JOB_TOPIC" \
+          --partitions "$$JOB_PARTITIONS" \
+          --replication-factor 1
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --create \
+          --if-not-exists \
+          --topic "$$RESULT_TOPIC" \
+          --partitions "$$RESULT_PARTITIONS" \
+          --replication-factor 1
+
+        CURRENT_JOB_PARTITIONS="$$( \
+          /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server kafka:9092 \
+            --describe \
+            --topic "$$JOB_TOPIC" \
+          | head -n 1 \
+          | sed -n 's/.*PartitionCount: \([0-9][0-9]*\).*/\1/p' \
+        )"
+
+        echo "Current $$JOB_TOPIC partitions: $$CURRENT_JOB_PARTITIONS"
+        echo "Desired $$JOB_TOPIC partitions: $$JOB_PARTITIONS"
+
+        if [ -n "$$CURRENT_JOB_PARTITIONS" ] && \
+           [ "$$CURRENT_JOB_PARTITIONS" -lt "$$JOB_PARTITIONS" ]; then
+
+          echo "Increasing $$JOB_TOPIC from $$CURRENT_JOB_PARTITIONS to $$JOB_PARTITIONS partitions"
+
+          /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server kafka:9092 \
+            --alter \
+            --topic "$$JOB_TOPIC" \
+            --partitions "$$JOB_PARTITIONS"
+        fi
+
+        echo "=== Final Kafka topic status ==="
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --describe \
+          --topic "$$JOB_TOPIC"
+
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:9092 \
+          --describe \
+          --topic "$$RESULT_TOPIC"
+
+        echo "=== Kafka initialization completed ==="
+
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-airflow}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:-airflow}
-      TZ: ${TZ:-Asia/Taipei}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow} -d ${POSTGRES_DB:-airflow}"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-    networks: [recipe-net]
+      KAFKA_JOB_TOPIC: ${KAFKA_JOB_TOPIC:-crawler_jobs}
+      KAFKA_RESULT_TOPIC: ${KAFKA_RESULT_TOPIC:-ytower_recipe_results}
+      KAFKA_JOB_PARTITIONS: ${KAFKA_JOB_PARTITIONS:-5}
+      KAFKA_RESULT_PARTITIONS: ${KAFKA_RESULT_PARTITIONS:-4}
+
+    networks:
+      - recipe-net
 
   airflow-init:
     <<: *airflow-common
