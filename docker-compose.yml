@@ -24,7 +24,6 @@ x-airflow-common: &airflow-common
     MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     MAX_SEQ_NUMBER: ${MAX_SEQ_NUMBER:-5000}
     MAX_NOT_FOUND_LIMIT: ${MAX_NOT_FOUND_LIMIT:-50}
-    BACKTRACK_COUNT: ${BACKTRACK_COUNT:-10}
     YTOWER_DAG_SCHEDULE: ${YTOWER_DAG_SCHEDULE:-}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
@@ -62,6 +61,10 @@ x-crawler-common: &crawler-common
     COOLDOWN_SUCCESS_COUNT: ${COOLDOWN_SUCCESS_COUNT:-50}
     CRAWL_SLEEP_MIN: ${CRAWL_SLEEP_MIN:-2.5}
     CRAWL_SLEEP_MAX: ${CRAWL_SLEEP_MAX:-5.0}
+    DIRECT_CRAWL_SLEEP_MIN: ${DIRECT_CRAWL_SLEEP_MIN:-4.0}
+    DIRECT_CRAWL_SLEEP_MAX: ${DIRECT_CRAWL_SLEEP_MAX:-8.0}
+    DIRECT_BLOCK_COOLDOWN_SECONDS: ${DIRECT_BLOCK_COOLDOWN_SECONDS:-900}
+    DIRECT_BLOCK_MAX_RETRIES: ${DIRECT_BLOCK_MAX_RETRIES:-2}
     NOT_FOUND_SLEEP_MIN: ${NOT_FOUND_SLEEP_MIN:-0.5}
     NOT_FOUND_SLEEP_MAX: ${NOT_FOUND_SLEEP_MAX:-1.2}
     COOLDOWN_SLEEP_MIN: ${COOLDOWN_SLEEP_MIN:-10}
@@ -188,10 +191,20 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command: >
       "
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_JOB_TOPIC:-crawler_jobs} --partitions ${KAFKA_JOB_PARTITIONS:-4} --replication-factor 1 &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic ${KAFKA_RESULT_TOPIC:-ytower_recipe_results} --partitions ${KAFKA_RESULT_PARTITIONS:-4} --replication-factor 1 &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic ${KAFKA_JOB_TOPIC:-crawler_jobs} &&
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic ${KAFKA_RESULT_TOPIC:-ytower_recipe_results}
+      set -e;
+      JOB_TOPIC='${KAFKA_JOB_TOPIC:-crawler_jobs}';
+      JOB_PARTITIONS='${KAFKA_JOB_PARTITIONS:-5}';
+      RESULT_TOPIC='${KAFKA_RESULT_TOPIC:-ytower_recipe_results}';
+      RESULT_PARTITIONS='${KAFKA_RESULT_PARTITIONS:-4}';
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$JOB_TOPIC" --partitions "$$JOB_PARTITIONS" --replication-factor 1;
+      CURRENT=$$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$JOB_TOPIC" | sed -n 's/.*PartitionCount: \([0-9][0-9]*\).*/\1/p' | head -n1);
+      if [ -n "$$CURRENT" ] && [ "$$CURRENT" -lt "$$JOB_PARTITIONS" ]; then
+        echo "Increasing $$JOB_TOPIC partitions: $$CURRENT -> $$JOB_PARTITIONS";
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --alter --topic "$$JOB_TOPIC" --partitions "$$JOB_PARTITIONS";
+      fi;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$RESULT_TOPIC" --partitions "$$RESULT_PARTITIONS" --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$JOB_TOPIC";
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$RESULT_TOPIC"
       "
     networks: [recipe-net]
 
@@ -292,6 +305,16 @@ services:
     command: ["python", "/app/workers/proxy_manager.py"]
     networks: [recipe-net]
 
+  crawler-direct:
+    <<: *crawler-common
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *crawler-common-env
+      WORKER_NAME: crawler-direct
+      CRAWLER_NETWORK_MODE: direct
+
   crawler-worker-1:
     <<: *crawler-common
     depends_on:
@@ -302,6 +325,7 @@ services:
     environment:
       <<: *crawler-common-env
       WORKER_NAME: crawler-worker-1
+      CRAWLER_NETWORK_MODE: proxy
 
   crawler-worker-2:
     <<: *crawler-common
@@ -313,6 +337,7 @@ services:
     environment:
       <<: *crawler-common-env
       WORKER_NAME: crawler-worker-2
+      CRAWLER_NETWORK_MODE: proxy
 
   crawler-worker-3:
     <<: *crawler-common
@@ -324,6 +349,7 @@ services:
     environment:
       <<: *crawler-common-env
       WORKER_NAME: crawler-worker-3
+      CRAWLER_NETWORK_MODE: proxy
 
   crawler-worker-4:
     <<: *crawler-common
@@ -335,6 +361,7 @@ services:
     environment:
       <<: *crawler-common-env
       WORKER_NAME: crawler-worker-4
+      CRAWLER_NETWORK_MODE: proxy
 
   mongo-writer:
     build:

@@ -1,32 +1,11 @@
-# Changes and validation
+# V1 Full Run 修改摘要
 
-## 主要修改
-
-- 移除固定 `PROXY_1..PROXY_4`。
-- 新增 `proxy-manager` 常駐服務。
-- 免費來源以 Taiwan/TW 為主：ProxyScrape、Databay、IPLocate。
-- Proxy 經 HTTPS 實際 request 驗證，不只相信來源清單。
-- 驗證出口 IP，並再次確認 country code = TW。
-- Proxy 資料保存於 MongoDB `proxy_pool`。
-- 四個 crawler worker 透過 lease 取得不同可用 Proxy。
-- Proxy timeout/連線錯誤/429/5xx 會切換代理，不算成「食譜不存在」。
-- 爬蟲結果仍然先送 Kafka，再由 `mongo-writer` upsert 到 MongoDB。
-- Airflow DAG 更名為 `ytower_recipe_dispatch_proxy_pool`。
-
-## 已做靜態驗證
-
-- Python `compileall` 通過。
-- `docker-compose.yml` YAML parsing 通過。
-- Compose 中存在 proxy-manager、4 crawler workers、mongo-writer。
-
-## GCP VM 上仍需做的 runtime 驗證
-
-```bash
-docker compose build
-docker compose up -d
-docker compose ps
-docker compose logs proxy-manager
-./scripts/verify-stack.sh
-```
-
-因免費 TW Proxy 供應量會變動，`proxy-manager` 顯示 0 個可用 Proxy 不一定代表程式錯誤，需同時檢查各來源 log 與當下公開 Proxy 供應。
+- 回到 V1：每個 prefix 一個大 job，不切 250 chunk。
+- Kafka `crawler_jobs` 改為 5 partitions，並在既有 topic 少於 5 partitions 時自動增加。
+- 新增 `crawler-direct`，使用直接出口 IP。
+- 保留 4 個 Proxy workers；Proxy worker 取得有效 TW Proxy 後才加入 Kafka consumer group。
+- Airflow DAG 改為 `ytower_recipe_dispatch_full_run`，完全忽略 checkpoint 與 MongoDB 既有最大 SEQ；每次固定從 1 開始。
+- 3 位數 / 4 位數候選以 numeric SEQ 為單位判斷，避免一個 numeric SEQ 被計成兩次 missing。
+- CAPTCHA/challenge、403、429、網路/Proxy 錯誤不計入 consecutive missing。
+- Direct worker 遇 challenge 會 cooldown；Proxy worker 遇 challenge 會切換 Proxy。
+- 靜態 Python compile 與 docker-compose YAML parse 已通過。

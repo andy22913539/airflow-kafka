@@ -1,84 +1,78 @@
-# Recipe Stack - Kafka + MongoDB + Dynamic Taiwan Proxy Pool
+# YTower Crawler Stack — V1 Full Run
 
-這版保留原本資料流：
+這版保留 V1「每個 prefix 一個大 job」架構，改成 5 個 Kafka job partitions、1 個 Direct Worker + 4 個動態 TW Proxy Worker。**不讀 checkpoint、不依 MongoDB 既有進度決定起點；每次觸發 DAG 都從 numeric SEQ 1 完整重跑。**
 
-```text
-Airflow -> Kafka(crawler_jobs) -> 4 crawler workers -> Dynamic TW Proxy Pool -> YTower
-                                                -> Kafka(ytower_recipe_results)
-                                                -> mongo-writer -> MongoDB
-```
+## 主要服務
 
-## Proxy 不再手動維護
+- Airflow 2.9.2：手動派發 90 個 prefix jobs
+- Kafka：`crawler_jobs` 5 partitions；`ytower_recipe_results` 4 partitions
+- `crawler-direct`：直接使用主機 / GCP 對外 IP
+- `crawler-worker-1..4`：取得已驗證 TW Proxy 後才加入 Kafka consumer group
+- `proxy-manager`：定期探索、驗證、更新 Proxy Pool
+- `mongo-writer`：消費結果並 upsert 到 MongoDB
+- MongoDB / MySQL / PostgreSQL
 
-`proxy-manager` 會定期從機器可讀的免費來源收集台灣 Proxy，驗證 HTTPS、出口 IP、國家代碼與延遲，存入 MongoDB `recipe_ai.proxy_pool`。
+## 爬取規則
 
-目前預設來源：
+- Prefix：A01～I10，共 90 個。
+- 每個 job：`start_num=1` 到 `MAX_SEQ_NUMBER=5000`（可由 `.env` 調整）。
+- numeric SEQ 同時保留 4 位數 + 3 位數網站格式：7 → `0007` / `007`；100 → `0100` / `100`。
+- 同一 numeric SEQ 的候選格式都沒有食譜才算 1 次 missing。
+- 連續 `MAX_NOT_FOUND_LIMIT=50` 個 numeric SEQ 沒資料才停止該 prefix。
+- CAPTCHA/challenge、403、429、網路/Proxy 錯誤不算 missing。
+- Direct 遇 challenge：cooldown 後重試；仍被擋則該 Kafka job 不 commit。
+- Proxy 遇 challenge：標記失敗並換 Proxy；不包含 CAPTCHA 自動解題。
 
-1. ProxyScrape v4 Taiwan free proxy API
-   - https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=tw
-2. Databay country-specific Taiwan proxy lists
-   - https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/by-country/tw/http.txt
-   - https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/by-country/tw/socks4.txt
-   - https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/by-country/tw/socks5.txt
-3. IPLocate Taiwan proxy list
-   - https://raw.githubusercontent.com/iplocate/free-proxy-list/main/countries/TW/proxies.txt
+## 第一次啟動
 
-Proxy 實際出口 IP 會先透過 `api.ipify.org` 驗證，再使用 `countries.dev`（失敗時 fallback 到 `ipwho.is`）確認出口國家為 `TW`。
+PowerShell：
 
-> 免費 Proxy 數量與可用性波動很大；如果當下沒有通過驗證的 TW Proxy，crawler worker 會等待，不會偷偷使用 GCP 真實出口 IP。
+```powershell
+Copy-Item .env.example .env
+notepad .env
 
-## 啟動
-
-```bash
-./scripts/bootstrap-env.sh
 docker compose build
 docker compose up -d
+docker compose ps
 ```
 
-查看 Proxy Pool：
+`.env` 不會放進 Git，請先從 `.env.example` 建立並填入密碼與 Airflow Fernet Key。
 
-```bash
+## 開始完整重跑
+
+```powershell
+$Date = Get-Date -Format "yyyy-MM-dd"
+
+docker compose exec airflow-scheduler `
+  airflow dags test `
+  ytower_recipe_dispatch_full_run `
+  $Date
+```
+
+每執行一次都會重新派發 90 個從 1 開始的大 job，請不要在同一輪尚未完成時重複觸發。
+
+## 檢查
+
+```powershell
+docker compose logs -f crawler-direct
+```
+
+```powershell
 docker compose logs -f proxy-manager
-docker compose exec -T proxy-manager python /app/scripts/check_proxy_pool.py
 ```
 
-完整驗證：
-
-```bash
-./scripts/verify-stack.sh
+```powershell
+docker compose logs -f mongo-writer
 ```
 
-確認有可用 TW Proxy 後，觸發 Airflow DAG：
+Kafka job topic 應為 5 partitions：
 
-```text
-ytower_recipe_dispatch_proxy_pool
+```powershell
+docker compose exec kafka `
+  /opt/kafka/bin/kafka-topics.sh `
+  --bootstrap-server kafka:9092 `
+  --describe `
+  --topic crawler_jobs
 ```
 
-## MongoDB Collections
-
-- `recipes`：由 `mongo-writer` 從 Kafka `ytower_recipe_results` upsert。
-- `proxy_pool`：由 `proxy-manager` 維護免費代理的來源、出口 IP、TW 國家驗證、延遲、成功失敗次數與 lease。
-
-## Proxy Pool 設定
-
-`.env` 主要參數：
-
-```env
-PROXY_COUNTRY_CODE=TW
-PROXY_DISCOVERY_INTERVAL=1800
-PROXY_VALIDATION_TIMEOUT=8
-PROXY_VALIDATION_WORKERS=20
-PROXY_MAX_VALIDATE_PER_CYCLE=120
-PROXY_MAX_LATENCY_MS=5000
-PROXY_MAX_FAILURES=3
-PROXY_LEASE_SECONDS=1800
-PROXY_WAIT_SECONDS=15
-MAX_PROXY_SWITCHES_PER_SEQ=5
-PROXY_STALE_HOURS=12
-```
-
-四個 crawler worker 會以 MongoDB 原子 lease 方式取得不同 Proxy。Proxy 失敗會增加失敗次數、釋放租約並換下一個；連續失敗達門檻會暫停使用。Prefix 完成或 worker 離開時會釋放 Proxy。
-
-## 安全注意
-
-免費公開 Proxy 不可信。這個專案只應讓公開網站 GET 請求經過免費 Proxy，不要傳送密碼、Cookie、API token 或其他敏感資料。程式沒有關閉 TLS certificate verification。
+更完整說明請看 `FULL_RUN_V1.md`。

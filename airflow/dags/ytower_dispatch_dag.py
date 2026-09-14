@@ -1,22 +1,14 @@
 from datetime import datetime, timedelta
 import json
 import os
-from urllib.parse import quote_plus
 
 from airflow import DAG
 from airflow.decorators import task
 from kafka import KafkaProducer
-from pymongo import MongoClient
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 KAFKA_JOB_TOPIC = os.getenv("KAFKA_JOB_TOPIC", "crawler_jobs")
-MONGO_DATABASE = os.getenv("MONGO_DATABASE", "recipe_ai")
-MONGO_HOST = os.getenv("MONGO_HOST", "mongodb")
-MONGO_PORT = int(os.getenv("MONGO_INTERNAL_PORT", "27017"))
-MONGO_APP_USER = os.environ.get("MONGO_APP_USER", "")
-MONGO_APP_PASSWORD = os.environ.get("MONGO_APP_PASSWORD", "")
 MAX_SEQ_NUMBER = int(os.getenv("MAX_SEQ_NUMBER", "5000"))
-BACKTRACK_COUNT = int(os.getenv("BACKTRACK_COUNT", "10"))
 MAX_NOT_FOUND_LIMIT = int(os.getenv("MAX_NOT_FOUND_LIMIT", "50"))
 DAG_SCHEDULE = os.getenv("YTOWER_DAG_SCHEDULE", "").strip() or None
 
@@ -29,36 +21,6 @@ def generate_prefixes(letters="ABCDEFGHI", num1_range=(1, 10)):
     ]
 
 
-def get_mongo_collection():
-    uri = (
-        f"mongodb://{quote_plus(MONGO_APP_USER)}:{quote_plus(MONGO_APP_PASSWORD)}"
-        f"@{MONGO_HOST}:{MONGO_PORT}/{MONGO_DATABASE}?authSource={MONGO_DATABASE}"
-    )
-    client = MongoClient(uri, serverSelectionTimeoutMS=10000)
-    return client, client[MONGO_DATABASE]["recipes"]
-
-
-def latest_numeric_seq(collection, prefix):
-    pipeline = [
-        {"$match": {"SEQ": {"$regex": f"^{prefix}-\\d+$"}}},
-        {
-            "$project": {
-                "n": {
-                    "$convert": {
-                        "input": {"$arrayElemAt": [{"$split": ["$SEQ", "-"]}, 1]},
-                        "to": "int",
-                        "onError": 0,
-                        "onNull": 0,
-                    }
-                }
-            }
-        },
-        {"$group": {"_id": None, "max_n": {"$max": "$n"}}},
-    ]
-    row = next(collection.aggregate(pipeline), None)
-    return int(row["max_n"]) if row and row.get("max_n") else 0
-
-
 default_args = {
     "owner": "airflow",
     "depends_on_past": False,
@@ -69,14 +31,14 @@ default_args = {
 }
 
 with DAG(
-    dag_id="ytower_recipe_dispatch_proxy_pool",
+    dag_id="ytower_recipe_dispatch_full_run",
     default_args=default_args,
-    description="Airflow 派發 YTower 工作到 Kafka；4 workers 從動態台灣 Proxy Pool 取代理，再由 Kafka 寫入 MongoDB",
+    description="Full YTower rerun: dispatch all 90 prefixes from numeric SEQ 1 to Kafka",
     schedule_interval=DAG_SCHEDULE,
     start_date=datetime(2026, 1, 1),
     catchup=False,
     max_active_runs=1,
-    tags=["crawler", "ytower", "kafka", "proxy-pool", "taiwan"],
+    tags=["crawler", "ytower", "kafka", "full-run", "direct", "proxy"],
 ) as dag:
 
     @task()
@@ -87,26 +49,23 @@ with DAG(
             acks="all",
             retries=5,
         )
-        mongo_client, collection = get_mongo_collection()
         count = 0
         try:
             for prefix in generate_prefixes():
-                latest = latest_numeric_seq(collection, prefix)
-                start_num = max(1, latest - BACKTRACK_COUNT) if latest else 1
+                # 明確忽略 MongoDB 與任何 checkpoint；每次 DAG 都從 1 完整重跑。
                 job = {
                     "prefix": prefix,
-                    "start_num": start_num,
+                    "start_num": 1,
                     "end_num": MAX_SEQ_NUMBER,
                     "max_not_found_limit": MAX_NOT_FOUND_LIMIT,
                 }
                 producer.send(KAFKA_JOB_TOPIC, value=job)
                 count += 1
-                print(f"dispatch {prefix}: start={start_num}")
+                print(f"dispatch full-run {prefix}: start=1 end={MAX_SEQ_NUMBER}")
             producer.flush()
-            print(f"dispatched {count} jobs to {KAFKA_JOB_TOPIC}")
+            print(f"dispatched {count} full-run jobs to {KAFKA_JOB_TOPIC}")
             return count
         finally:
             producer.close()
-            mongo_client.close()
 
     dispatch_jobs()
